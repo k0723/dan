@@ -1,4 +1,4 @@
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
 from sklearn.preprocessing import normalize
 from sklearn.metrics import silhouette_score
 import hdbscan
@@ -7,13 +7,14 @@ import re
 import time
 from collections import defaultdict
 from keybert import KeyBERT
+from agents.agent_launcher import launch_agents
 
 # 모델 초기화
 model = SentenceTransformer('all-MiniLM-L6-v2')
 kw_model = KeyBERT(model='all-MiniLM-L6-v2')
-
+SIM_THRESHOLD = 0.7
 # 조사 제거용 리스트
-POSTPOSITIONS = ["은", "는", "이", "가", "을", "를", "에", "에서", "에게", "로", "으로", "과", "와", "도", "만", "까지", "부터"]
+POSTPOSITIONS = ["은", "는", "이", "가", "을", "를", "에", "에서", "에게", "로", "으로", "과", "와", "도", "만", "까지", "부터", "의"]
 
 # 조사 제거 함수
 def clean_postpositions(word: str) -> str:
@@ -39,110 +40,95 @@ def fallback_keyword_with_llm(text: str) -> str:
 
 # 키워드 추출 함수
 
-def extract_keywords(texts: list[str], timeout: float = 3.0) -> list[str]:
-    raw_keywords = []
-
+def extract_keywords(texts: list[str]) -> list[str]:
+    """
+    각 문장에서 KeyBERT로 상위 1개 키워드를 추출하고,
+    조사 제거 후 반환합니다.
+    """
+    keywords = []
     for text in texts:
         try:
-            print("🔍 입력 문장:", text)
-            start_time = time.time()
-
-            keywords = kw_model.extract_keywords(text, top_n=1)
-            print("🧠 KeyBERT 결과:", keywords)
-            if not keywords or not keywords[0]:
-                raise ValueError("kw_model 실패")
-
-            raw_keyword = keywords[0][0]
-            cleaned = clean_postpositions(raw_keyword)
-            print("🧼 조사 제거 후:", cleaned)
-
-            if len(cleaned) < 2 or not cleaned.isalnum():
-                raise ValueError("키워드 너무 짧거나 유효하지 않음")
-
-            if time.time() - start_time > timeout:
-                raise TimeoutError("키워드 추출 시간 초과")
-
-            raw_keywords.append(cleaned)
-
+            # KeyBERT로 top_n=1 키워드 뽑기
+            result = kw_model.extract_keywords(text, top_n=1)
+            if not result:
+                raise ValueError("키워드 없음")
+            raw_kw = result[0][0]
+            # 조사 제거
+            cleaned = clean_postpositions(raw_kw)
+            keywords.append(cleaned)
         except Exception as e:
-            print("⚠️ 예외 발생:", e)
-            keyword = fallback_keyword_with_llm(text)
-            cleaned = clean_postpositions(keyword)
-            print("🤖 LLM 대체 키워드:", cleaned)
-            if cleaned:
-                raw_keywords.append(cleaned)
-
-    # ✅ 조사 제거 후 중복 키워드 제거
-    unique_keywords = []
-    seen = set()
-    for kw in raw_keywords:
-        base = clean_postpositions(kw)
-        if base and base not in seen:
-            seen.add(base)
-            unique_keywords.append(base)
-
-    return unique_keywords
-
+            # KeyBERT 실패 시 LLM 백업 호출
+            fb = fallback_keyword_with_llm(text)
+            cleaned_fb = clean_postpositions(fb)
+            if cleaned_fb:
+                keywords.append(cleaned_fb)
+            else:
+                # LLM도 실패하면 빈 문자열 또는 기본값
+                keywords.append("")
+    return keywords
 
 # 전체 분석 함수 (클러스터링 + 키워드)
 def analyze_texts(texts: list[str]) -> dict:
-    # 1. 임베딩
-    embeddings = model.encode(texts, show_progress_bar=True)
-    embeddings = normalize(embeddings)
+    # 1) 문장별 키워드 추출
+    raw_keywords = extract_keywords(texts)
+    # 순서 유지 중복 제거
+    unique_keywords = list(dict.fromkeys(raw_keywords))
+    if not unique_keywords:
+        return {"clusters": {}, "keywords": []}
 
-    # 2. HDBSCAN 군집화
-    best_score = -1
-    best_labels = None
-    best_size = None
-    for size in range(2, min(10, len(texts))):
-        clusterer = hdbscan.HDBSCAN(min_cluster_size=size)
-        labels = clusterer.fit_predict(embeddings)
+    # 2) 키워드 임베딩
+    kw_embeddings = model.encode(unique_keywords, show_progress_bar=False)
+    kw_embeddings = normalize(kw_embeddings)
 
-        if len(set(labels)) <= 1 or all(l == -1 for l in labels):
-            continue
+    # 3) HDBSCAN으로 키워드 클러스터링
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=2)
+    kw_labels = clusterer.fit_predict(kw_embeddings)
 
-        try:
-            score = silhouette_score(embeddings, labels)
-            if score > best_score:
-                best_score = score
-                best_labels = labels
-                best_size = size
-        except:
-            continue
-
-    # 3. 군집 실패 시 fallback
-    if best_labels is None:
-        return {
-            "clusters": {
-                f"Text {i}": {
-                    "summary": text[:100] + "...",
-                    "cluster": -1
-                } for i, text in enumerate(texts)
-            },
-            "keywords": extract_keywords(texts)
-        }
-
-    # 4. 군집 결과 구성
+    # 4) 클러스터 정보 구성
     clusters = defaultdict(list)
-    valid_texts = []
-    for text, label in zip(texts, best_labels):
-        clusters[label].append(text)
-        if label != -1:
-            valid_texts.append(text)
+    for kw, label in zip(unique_keywords, kw_labels):
+        clusters[label].append(kw)
 
     cluster_info = {}
-    for label, cluster_texts in clusters.items():
-        summary = cluster_texts[0][:100] + "..."
+    for label, kws in clusters.items():
+        if label == -1:
+            # 노이즈 클러스터는 건너뛰거나 따로 처리
+            continue
+        # 대표 키워드: 해당 클러스터 내에서 가장 빈번한(여기선 첫 번째) 키워드
+        rep = kws[0]
         cluster_info[f"Cluster {label}"] = {
-            "count": len(cluster_texts),
-            "summary": summary,
-            "min_cluster_size": best_size
+            "keywords": kws,
+            "representative": rep,
+            "count": len(kws)
         }
-
-    # 5. 키워드 추출 (클러스터링 된 텍스트만)
-    keywords = extract_keywords(valid_texts)
-
+    launch_agents(unique_keywords)
+    # 5) 결과 반환
     return {
         "clusters": cluster_info,
-        "keywords": keywords
+        "keywords": unique_keywords
     }
+
+
+def group_by_similarity(texts: list[str], threshold: float = SIM_THRESHOLD) -> dict:
+    embeddings = model.encode(texts, convert_to_tensor=True)
+    visited = set()
+    clusters = defaultdict(list)
+    cluster_id = 0
+
+    for i in range(len(texts)):
+        if i in visited:
+            continue
+        clusters[cluster_id].append(texts[i])
+        visited.add(i)
+
+        for j in range(i + 1, len(texts)):
+            if j in visited:
+                continue
+            sim = util.cos_sim(embeddings[i], embeddings[j]).item()
+            if sim >= threshold:
+                clusters[cluster_id].append(texts[j])
+                visited.add(j)
+
+        cluster_id += 1
+
+    return dict(clusters)

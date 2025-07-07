@@ -7,6 +7,4 @@ router = APIRouter()
 @router.post("/")
 def analyze(request: TextsRequest):
     result = analyze_texts(request.texts)
-    keyword = extract_keywords(request.texts)
-    return {"clusters": result,
-            "keywords": keyword}
+    return result
